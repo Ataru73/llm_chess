@@ -259,33 +259,39 @@ def build_prompt(board, llm_color, last_error=None):
 
 
 def _try_parse(board, token):
+    """Returns (move, error): a legal move, or None and why the token was rejected."""
     token = token.strip().strip(".,;:!?*\"'`()[]")
     token = re.sub(r"^\d+\.+", "", token)  # "12.Nf3" / "12...Nf3"
     token = token.replace("0-0-0", "O-O-O").replace("0-0", "O-O")
     if not token:
-        return None
+        return None, "the MOVE line was empty"
+    error = f"'{token}' is not a valid move"
     for parse in (board.parse_san, board.parse_uci):
         try:
-            return parse(token)
+            return parse(token), None
+        except chess.AmbiguousMoveError:
+            error = f"'{token}' is ambiguous here; add the origin file or rank"
+        except chess.IllegalMoveError:
+            error = f"'{token}' is not a legal move in this position"
         except ValueError:
             continue
-    return None
+    return None, error
 
 
 def parse_move(board, text):
-    """Extract a legal move from the LLM reply, or None."""
+    """Returns (move, error): the LLM's legal move, or None and why the reply was rejected."""
     text = text.replace("**", "")
-    # 1) Preferred: the explicit "MOVE: xxx" line (last occurrence wins).
-    for match in reversed(re.findall(r"MOVE\s*[:\-]\s*([^\s]+)", text, re.IGNORECASE)):
-        move = _try_parse(board, match)
-        if move:
-            return move
-    # 2) Fallback: any token that is a legal move, scanning from the end.
+    # 1) The explicit "MOVE: xxx" line is the LLM's answer (last occurrence wins).
+    #    If it's illegal, reject the reply rather than guessing another move from it.
+    matches = re.findall(r"MOVE\s*[:\-]\s*([^\s]+)", text, re.IGNORECASE)
+    if matches:
+        return _try_parse(board, matches[-1])
+    # 2) No MOVE line at all: take the last token that is a legal move.
     for token in reversed(re.split(r"\s+", text)):
-        move = _try_parse(board, token)
+        move, _ = _try_parse(board, token)
         if move:
-            return move
-    return None
+            return move, None
+    return None, "it had no 'MOVE: <move>' line and no legal move could be read from it"
 
 
 def ask_llm_for_move(provider, model, board, llm_color, log, attempts=3):
@@ -294,10 +300,10 @@ def ask_llm_for_move(provider, model, board, llm_color, log, attempts=3):
     for attempt in range(1, attempts + 1):
         reply = provider.complete(model, SYSTEM_PROMPT, build_prompt(board, llm_color, error))
         log(f"[{model}] attempt {attempt}:\n{reply.strip()}\n")
-        move = parse_move(board, reply)
+        move, error = parse_move(board, reply)
         if move:
             return move, False
-        error = "no legal move could be read from it"
+        log(f"Rejected: {error}\n")
     return random.choice(list(board.legal_moves)), True
 
 
