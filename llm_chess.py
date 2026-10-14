@@ -14,7 +14,7 @@ import threading
 import tkinter as tk
 import urllib.error
 import urllib.request
-from tkinter import messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk
 
 import chess
 import chess.pgn
@@ -312,6 +312,19 @@ HIGHLIGHT_SEL = "#829769"
 CHECK_COLOR = "#e06666"
 GLYPHS = {"k": "♚", "q": "♛", "r": "♜", "b": "♝", "n": "♞", "p": "♟"}
 
+# Font preferences per role; the first family installed on this system wins.
+UI_FONTS = ("Segoe UI", "SF Pro Text", "Helvetica Neue", "DejaVu Sans", "Noto Sans", "Liberation Sans")
+MONO_FONTS = ("Consolas", "Menlo", "DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono")
+PIECE_FONTS = ("Segoe UI Symbol", "Apple Symbols", "DejaVu Sans", "Noto Sans Symbols 2", "FreeSerif")
+
+
+def pick_font(candidates, fallback):
+    """Return the first installed font family from candidates, else the family
+    behind the named Tk font `fallback` (needs a Tk root)."""
+    installed = set(tkfont.families())
+    return next((f for f in candidates if f in installed),
+                tkfont.nametofont(fallback).actual("family"))
+
 
 class ChessApp:
     def __init__(self, root):
@@ -327,6 +340,10 @@ class ChessApp:
         self.thinking = False
         self.board_locked = False  # set after resigning
         self.game_id = 0  # invalidates in-flight LLM replies after New game / Undo
+
+        self.ui_font = pick_font(UI_FONTS, "TkDefaultFont")
+        self.mono_font = pick_font(MONO_FONTS, "TkFixedFont")
+        self.piece_font = pick_font(PIECE_FONTS, "TkDefaultFont")
 
         self._build_controls()
         self._build_board()
@@ -383,7 +400,7 @@ class ChessApp:
         self.canvas.pack()
         self.canvas.bind("<Button-1>", self.on_click)
         self.status_var = tk.StringVar()
-        ttk.Label(left, textvariable=self.status_var, font=("Segoe UI", 11, "bold"),
+        ttk.Label(left, textvariable=self.status_var, font=(self.ui_font, 11, "bold"),
                   wraplength=SQUARE * 8).pack(pady=6, anchor="w")
 
     def _build_side_panel(self):
@@ -399,13 +416,13 @@ class ChessApp:
 
         ttk.Label(right, text="Moves").pack(anchor="w", pady=(8, 0))
         self.moves_text = tk.Text(right, height=10, width=40, wrap="word", state="disabled",
-                                  font=("Consolas", 10))
+                                  font=(self.mono_font, 10))
         self.moves_text.pack(fill=tk.X)
 
         ttk.Label(right, text="LLM replies").pack(anchor="w", pady=(8, 0))
         log_frame = ttk.Frame(right)
         log_frame.pack(fill=tk.BOTH, expand=True)
-        self.log_text = tk.Text(log_frame, wrap="word", state="disabled", font=("Consolas", 9))
+        self.log_text = tk.Text(log_frame, wrap="word", state="disabled", font=(self.mono_font, 9))
         sb = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         self.log_text.config(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -634,7 +651,7 @@ class ChessApp:
             def choose(p=ptype):
                 result["piece"] = p
                 dlg.destroy()
-            tk.Button(dlg, text=GLYPHS[sym], font=("Segoe UI Symbol", 32), width=2,
+            tk.Button(dlg, text=GLYPHS[sym], font=(self.piece_font, 32), width=2,
                       command=choose).pack(side=tk.LEFT, padx=4, pady=4)
         dlg.grab_set()
         self.root.wait_window(dlg)
@@ -669,7 +686,7 @@ class ChessApp:
                 cx, cy = x0 + SQUARE / 2, y0 + SQUARE / 2
                 if piece:
                     glyph = GLYPHS[piece.symbol().lower()]
-                    font = ("Segoe UI Symbol", int(SQUARE * 0.62))
+                    font = (self.piece_font, int(SQUARE * 0.62))
                     if piece.color == chess.WHITE:
                         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)):
                             c.create_text(cx + dx * 1.5, cy + dy * 1.5, text=glyph, font=font, fill="#222")
@@ -688,8 +705,8 @@ class ChessApp:
             file_label = chess.FILE_NAMES[7 - i if self.flipped else i]
             rank_label = str(i + 1 if self.flipped else 8 - i)
             c.create_text(10 + i * SQUARE + SQUARE - 6, 10 + 8 * SQUARE - 8, text=file_label,
-                          font=("Segoe UI", 9, "bold"), fill="#444")
-            c.create_text(16, 10 + i * SQUARE + 10, text=rank_label, font=("Segoe UI", 9, "bold"), fill="#444")
+                          font=(self.ui_font, 9, "bold"), fill="#444")
+            c.create_text(16, 10 + i * SQUARE + 10, text=rank_label, font=(self.ui_font, 9, "bold"), fill="#444")
 
     def update_moves(self):
         game = chess.pgn.Game.from_board(self.board)
