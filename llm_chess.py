@@ -60,7 +60,12 @@ class Provider:
         raise NotImplementedError
 
     def complete(self, model, system, prompt):
+        """Returns (reply_text, (input_tokens, output_tokens))."""
         raise NotImplementedError
+
+    def price_per_million(self, model):
+        """(input, output) USD per 1M tokens if the provider publishes it, else None."""
+        return None
 
 
 class AnthropicProvider(Provider):
@@ -87,7 +92,9 @@ class AnthropicProvider(Provider):
             "system": system,
             "messages": [{"role": "user", "content": prompt}],
         })
-        return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        usage = data.get("usage") or {}
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        return text, (usage.get("input_tokens") or 0, usage.get("output_tokens") or 0)
 
 
 class OpenAICompatibleProvider(Provider):
@@ -117,7 +124,8 @@ class OpenAICompatibleProvider(Provider):
         content = data["choices"][0]["message"].get("content") or ""
         if isinstance(content, list):  # some providers return content parts
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-        return content
+        usage = data.get("usage") or {}
+        return content, (usage.get("prompt_tokens") or 0, usage.get("completion_tokens") or 0)
 
 
 class OpenAIProvider(OpenAICompatibleProvider):
@@ -151,9 +159,24 @@ class OpenRouterProvider(OpenAICompatibleProvider):
     name = "OpenRouter"
     base = "https://openrouter.ai/api/v1"
 
+    def __init__(self, api_key):
+        super().__init__(api_key)
+        self.prices = {}
+
     def list_models(self):
         data = http_json(f"{self.base}/models", self._headers())
+        for m in data.get("data", []):
+            try:
+                pricing = m.get("pricing") or {}
+                prices = (float(pricing["prompt"]) * 1e6, float(pricing["completion"]) * 1e6)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if min(prices) >= 0:  # negative means variable pricing (e.g. openrouter/auto)
+                self.prices[m["id"]] = prices
         return sorted(m["id"] for m in data.get("data", []))
+
+    def price_per_million(self, model):
+        return self.prices.get(model)
 
 
 class MistralProvider(OpenAICompatibleProvider):
@@ -197,7 +220,10 @@ class GeminiProvider(Provider):
         if not candidates:
             raise RuntimeError(f"No candidates returned: {json.dumps(data)[:300]}")
         parts = candidates[0].get("content", {}).get("parts", [])
-        return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        usage = data.get("usageMetadata") or {}
+        output = (usage.get("candidatesTokenCount") or 0) + (usage.get("thoughtsTokenCount") or 0)
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        return text, (usage.get("promptTokenCount") or 0, output)
 
 
 PROVIDERS = {cls.name: cls for cls in (
@@ -294,11 +320,13 @@ def parse_move(board, text):
     return None, "it had no 'MOVE: <move>' line and no legal move could be read from it"
 
 
-def ask_llm_for_move(provider, model, board, llm_color, log, attempts=3):
-    """Returns (move, was_random). Retries on illegal/unparseable replies."""
+def ask_llm_for_move(provider, model, board, llm_color, log, on_usage, attempts=3):
+    """Returns (move, was_random). Retries on illegal/unparseable replies.
+    on_usage(input_tokens, output_tokens) is called after every request."""
     error = None
     for attempt in range(1, attempts + 1):
-        reply = provider.complete(model, SYSTEM_PROMPT, build_prompt(board, llm_color, error))
+        reply, usage = provider.complete(model, SYSTEM_PROMPT, build_prompt(board, llm_color, error))
+        on_usage(*usage)
         log(f"[{model}] attempt {attempt}:\n{reply.strip()}\n")
         move, error = parse_move(board, reply)
         if move:
@@ -346,6 +374,8 @@ class ChessApp:
         self.thinking = False
         self.board_locked = False  # set after resigning
         self.game_id = 0  # invalidates in-flight LLM replies after New game / Undo
+        self.match_id = 0  # changes only on New game: token usage is billed to the game it was spent in
+        self.tokens_in = self.tokens_out = self.requests = 0
 
         self.ui_font = pick_font(UI_FONTS, "TkDefaultFont")
         self.mono_font = pick_font(MONO_FONTS, "TkFixedFont")
@@ -354,6 +384,7 @@ class ChessApp:
         self._build_controls()
         self._build_board()
         self._build_side_panel()
+        self.update_cost()
         self.redraw()
         self.set_status("Enter an API key, load models, then press New game.")
 
@@ -386,6 +417,7 @@ class ChessApp:
         self.model_var = tk.StringVar()
         self.model_combo = ttk.Combobox(frm, textvariable=self.model_var, state="readonly", width=50)
         self.model_combo.grid(row=1, column=1, sticky="we", padx=4, pady=(6, 0))
+        self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._fill_prices())
 
         ttk.Label(frm, text="You play:").grid(row=1, column=3, sticky="w", padx=(12, 0), pady=(6, 0))
         self.color_var = tk.StringVar(value="White")
@@ -419,6 +451,20 @@ class ChessApp:
         ttk.Button(btns, text="Undo move", command=self.undo).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Resign", command=self.resign).pack(side=tk.LEFT)
         ttk.Button(btns, text="Copy PGN", command=self.copy_pgn).pack(side=tk.LEFT, padx=4)
+
+        cost = ttk.LabelFrame(right, text="Game cost", padding=6)
+        cost.pack(fill=tk.X, pady=(8, 0))
+        self.price_in_var, self.price_out_var = tk.StringVar(), tk.StringVar()
+        ttk.Label(cost, text="$ per 1M tokens  in:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(cost, textvariable=self.price_in_var, width=8).grid(row=0, column=1, padx=4)
+        ttk.Label(cost, text="out:").grid(row=0, column=2, sticky="w")
+        ttk.Entry(cost, textvariable=self.price_out_var, width=8).grid(row=0, column=3, padx=4)
+        self.cost_var = tk.StringVar()
+        ttk.Entry(cost, textvariable=self.cost_var, state="readonly").grid(
+            row=1, column=0, columnspan=5, sticky="we", pady=(6, 0))
+        cost.columnconfigure(4, weight=1)
+        for var in (self.price_in_var, self.price_out_var):
+            var.trace_add("write", lambda *_: self.update_cost())
 
         ttk.Label(right, text="Moves").pack(anchor="w", pady=(8, 0))
         self.moves_text = tk.Text(right, height=10, width=40, wrap="word", state="disabled",
@@ -477,6 +523,7 @@ class ChessApp:
         self.provider = provider
         self.model_combo.config(values=models)
         self.model_var.set(models[0])
+        self._fill_prices()
         self.set_status(f"Loaded {len(models)} {provider.name} models. Pick one and press New game.")
 
     def _models_failed(self, name, err):
@@ -499,6 +546,9 @@ class ChessApp:
         self.selected = None
         self.thinking = False
         self.game_id += 1
+        self.match_id += 1
+        self.tokens_in = self.tokens_out = self.requests = 0
+        self.update_cost()
         self.board_locked = False
         self._clear_log()
         self.log(f"New game: you play {choice}, LLM is {self.model_var.get()} ({self.provider.name}).\n")
@@ -524,12 +574,18 @@ class ChessApp:
         llm_color = not self.human_color
         self.set_status(f"{model} is thinking...")
 
+        match_id = self.match_id
+
         def log(msg):
             self.root.after(0, lambda: self.game_id == game_id and self.log(msg))
 
+        def on_usage(tokens_in, tokens_out):
+            # Counted even if the reply is discarded by Undo/Resign: it was still paid for.
+            self.root.after(0, lambda: self.match_id == match_id and self.add_usage(tokens_in, tokens_out))
+
         def work():
             try:
-                move, was_random = ask_llm_for_move(provider, model, board, llm_color, log)
+                move, was_random = ask_llm_for_move(provider, model, board, llm_color, log, on_usage)
                 self.root.after(0, lambda: self._llm_moved(game_id, move, was_random))
             except Exception as e:  # noqa: BLE001
                 err = str(e)
@@ -722,6 +778,29 @@ class ChessApp:
         self.moves_text.insert(tk.END, text)
         self.moves_text.see(tk.END)
         self.moves_text.config(state="disabled")
+
+    # ---- cost ---------------------------------------------------------------
+
+    def _fill_prices(self):
+        prices = self.provider and self.provider.price_per_million(self.model_var.get())
+        self.price_in_var.set(f"{prices[0]:g}" if prices else "")
+        self.price_out_var.set(f"{prices[1]:g}" if prices else "")
+
+    def add_usage(self, tokens_in, tokens_out):
+        self.tokens_in += tokens_in
+        self.tokens_out += tokens_out
+        self.requests += 1
+        self.update_cost()
+
+    def update_cost(self):
+        tokens = f"{self.tokens_in:,} in / {self.tokens_out:,} out tokens, {self.requests} requests"
+        try:
+            price_in, price_out = float(self.price_in_var.get()), float(self.price_out_var.get())
+        except ValueError:
+            self.cost_var.set(f"{tokens}  (enter prices to see the cost)")
+            return
+        cost = (self.tokens_in * price_in + self.tokens_out * price_out) / 1e6
+        self.cost_var.set(f"${cost:.4f}  -  {tokens}")
 
     def set_status(self, text):
         self.status_var.set(text)
